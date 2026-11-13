@@ -209,23 +209,71 @@ func (cc *ChainConfig) monitorHealth(ctx context.Context, chainName string) {
 	}
 }
 
+// healthcheckInterval is how often to ping. ping_rate is a number of seconds, so "60" decodes to
+// 60ns and is scaled up; a value already a second or more ("60s") is used as is. A missing or
+// zero value would make time.NewTicker panic, so it falls back to 60 seconds.
+func healthcheckInterval(rate time.Duration) time.Duration {
+	switch {
+	case rate <= 0:
+		return 60 * time.Second
+	case rate < time.Second:
+		return rate * time.Second
+	default:
+		return rate
+	}
+}
+
+// pingHealthcheckURL makes one ping. The URL is a secret (anyone holding it can keep the check
+// green), so the error never contains it: *url.Error is unwrapped to the cause.
+func pingHealthcheckURL(client *http.Client, pingURL string) error {
+	resp, err := client.Get(pingURL)
+	if err != nil {
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			return ue.Err
+		}
+		return errors.New("request failed")
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return fmt.Errorf("status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// pingHealthcheck pings the dead man's switch until tenderduty stops, so the service behind the
+// URL alerts when tenderduty itself is down. It logs the first success and every change between
+// failing and working, never the URL.
 func (c *Config) pingHealthcheck() {
 	if !c.Healthcheck.Enabled {
 		return
 	}
-
-	ticker := time.NewTicker(c.Healthcheck.PingRate * time.Second)
+	if c.Healthcheck.PingURL == "" {
+		l("❌ healthcheck is enabled but ping_url is empty, not pinging")
+		return
+	}
+	interval := healthcheckInterval(c.Healthcheck.PingRate)
+	client := &http.Client{Timeout: 10 * time.Second}
+	l(fmt.Sprintf("🏓 healthcheck: pinging every %s", interval))
 
 	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		ok, logged := false, false
 		for {
 			select {
+			case <-c.ctx.Done():
+				return
 			case <-ticker.C:
-				_, err := http.Get(c.Healthcheck.PingURL)
-				if err != nil {
-					l(fmt.Sprintf("❌ Failed to ping healthcheck URL: %s", err.Error()))
-				} else {
-					l(fmt.Sprintf("🏓 Successfully pinged healthcheck URL: %s", c.Healthcheck.PingURL))
+				err := pingHealthcheckURL(client, c.Healthcheck.PingURL)
+				switch {
+				case err != nil && (ok || !logged):
+					l("❌ healthcheck ping failed:", err)
+				case err == nil && (!ok || !logged):
+					l("🏓 healthcheck ping ok")
 				}
+				ok, logged = err == nil, true
 			}
 		}
 	}()
