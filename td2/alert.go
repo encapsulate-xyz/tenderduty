@@ -71,6 +71,17 @@ func (a *alarmCache) clearNoBlocks(chain string) {
 	}
 }
 
+// isActive reports whether an alarm with this message is open for the chain, including one restored
+// from the state file at start.
+func (a *alarmCache) isActive(chain, message string) bool {
+	a.notifyMux.RLock()
+	defer a.notifyMux.RUnlock()
+	if a.AllAlarms == nil || a.AllAlarms[chain] == nil {
+		return false
+	}
+	return !a.AllAlarms[chain][message].IsZero()
+}
+
 func (a *alarmCache) getCount(chain string) int {
 	if a.AllAlarms == nil || a.AllAlarms[chain] == nil {
 		return 0
@@ -392,6 +403,24 @@ func (c *Config) alert(chainName, message, severity string, resolved bool, id *s
 	alarms.AllAlarms[chainName][message] = time.Now()
 }
 
+// pctMessage is the slashing window alarm's text. It is also the alarm's key in the alarm cache and the
+// state file, so the alarm and its clear must use the same text.
+func (cc *ChainConfig) pctMessage() string {
+	return fmt.Sprintf("%s has missed > %d%% of the slashing window's blocks on %s", cc.valInfo.Moniker, cc.Alerts.Window, cc.ChainId)
+}
+
+// pctAlarmChange decides whether the slashing window alarm fires or clears. The window is 0 until
+// GetValInfo has read the slashing params, and GetValInfo sets Missed before it does, so after a
+// restart with a flaky RPC the old check computed 100*missed/0 = +Inf and fired a false alarm.
+// Nothing changes until the window is known.
+func pctAlarmChange(active bool, missed, window int64, threshold int) (fire, resolve bool) {
+	if window <= 0 {
+		return false, false
+	}
+	pct := 100 * float64(missed) / float64(window)
+	return !active && pct > float64(threshold), active && pct < float64(threshold)
+}
+
 // watch handles monitoring for missed blocks, stalled chain, node downtime
 // and also updates a few prometheus stats
 // FIXME: not watching for nodes that are lagging the head block!
@@ -421,6 +450,10 @@ func (cc *ChainConfig) watch() {
 		noNodesSec = 0
 		break
 	}
+	// A slashing window alarm restored from the state file is still open in PagerDuty and Discord.
+	// Track it, so the clear below resolves it once the validator is back under the threshold.
+	pctAlarm = alarms.isActive(cc.name, cc.pctMessage())
+
 	// initial stat creation for nodes, we only update again if the node is positive
 	if td.Prom {
 		for _, node := range cc.Nodes {
@@ -546,27 +579,28 @@ func (cc *ChainConfig) watch() {
 		}
 
 		// window percentage missed block alarms
-		if cc.Alerts.PercentageAlerts && !pctAlarm && 100*float64(cc.valInfo.Missed)/float64(cc.valInfo.Window) > float64(cc.Alerts.Window) {
+		pctFire, pctClear := pctAlarmChange(pctAlarm, cc.valInfo.Missed, cc.valInfo.Window, cc.Alerts.Window)
+		if cc.Alerts.PercentageAlerts && pctFire {
 			// alert on missed block counter!
 			pctAlarm = true
 			id := cc.valInfo.Valcons + "percent"
 			td.alert(
 				cc.name,
-				fmt.Sprintf("%s has missed > %d%% of the slashing window's blocks on %s", cc.valInfo.Moniker, cc.Alerts.Window, cc.ChainId),
+				cc.pctMessage(),
 				cc.Alerts.PercentagePriority,
 				false,
 				&id,
 			)
 			cc.activeAlerts = alarms.getCount(cc.name)
-		} else if cc.Alerts.PercentageAlerts && pctAlarm && 100*float64(cc.valInfo.Missed)/float64(cc.valInfo.Window) < float64(cc.Alerts.Window) {
-			// clear the alert
+		} else if cc.Alerts.PercentageAlerts && pctClear {
+			// clear the alert, resolved so PagerDuty closes the incident too
 			pctAlarm = false
 			id := cc.valInfo.Valcons + "percent"
 			td.alert(
 				cc.name,
-				fmt.Sprintf("%s has missed > %d%% of the slashing window's blocks on %s", cc.valInfo.Moniker, cc.Alerts.Window, cc.ChainId),
+				cc.pctMessage(),
 				"info",
-				false,
+				true,
 				&id,
 			)
 			cc.activeAlerts = alarms.getCount(cc.name)
